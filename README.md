@@ -128,13 +128,13 @@ curl https://api.neogriffin.dev/v1/score?address=TOKEN&chain=solana \
 ### ✅ Phase 2 — Intelligence (Complete)
 Cross-agent threat sharing, replay protection, subagent immune system, intelligence module, SHA-256 audit trail
 
-### 🔄 Phase 3 — Post-Funding
+### 🔄 Phase 3 — Advanced Security
 Secure Memory (anti-poison), SDKs (JS/Python/Rust), MCP Server, historical scoring, arXiv paper
 
-### 📋 Phase 4 — Growth
+### 📋 Phase 4 — Ecosystem
 Proxy layer, B2B subscriptions, per-client dashboards, cumulative risk profiles
 
-### 🚀 Phase 5 — Scale
+### 🚀 Phase 5 — Global Scale
 Agent Journey Map, dynamic wallet reputation, pattern marketplace, decentralized threat sharing, ML
 
 ---
