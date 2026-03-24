@@ -120,16 +120,6 @@ curl https://api.neogriffin.dev/v1/score?address=TOKEN&chain=solana \
 
 ---
 
-## Dashboard
-
-Live production dashboard at [api.neogriffin.dev/activity](https://api.neogriffin.dev/activity):
-- Interactive demo — type an attack and see it blocked
-- Immune system status with live subagent data
-- Evolution chart — system learning over time
-- Real-time traffic and threat monitoring
-
----
-
 ## Roadmap
 
 ### ✅ Phase 1 — Core Security (Complete)
