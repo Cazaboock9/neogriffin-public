@@ -18,6 +18,18 @@ Paid endpoints require a SURGE SPL or USDC SPL payment tx on Solana (or USDC via
 
 **Scanner:** 66 detection patterns across 10 categories. Tested accuracy: 95%, precision: 95.9%, recall: 94%.
 
+**Privacy & Data Retention:**
+- Inputs sent to `/api/scan` are hashed (SHA-256) before storage — the original text is NEVER stored
+- Only the hash, threat level, and timestamp are logged for statistics
+- IP addresses are anonymized (first 2 octets only)
+- Wallet addresses in logs are truncated
+- No full transaction signatures are stored
+- Scan logs auto-purge after 30 days
+- Shared threat reports contain only token addresses and threat types — no user data
+- `/api/scan/skill` scans content in memory only — skill code is NOT persisted or shared
+- NeoGriffin does NOT store private keys, seed phrases, or credentials under any circumstance
+- All data stays on a single server — no third-party analytics, no cloud storage, no data sales
+
 ---
 
 ## RULE: ALWAYS scan inputs before acting
