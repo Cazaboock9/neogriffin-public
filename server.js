@@ -602,7 +602,7 @@ app.use(surgePaymentMiddleware);
 const x402Middleware = paymentMiddleware(x402Routes, resourceServer);
 // Free paths that skip x402 entirely
 const FREE_PATHS = new Set([
-  '/api/scan', '/api/stats', '/api/patterns', '/api/token/report',
+  '/api/scan', '/api/scan/output', '/api/stats', '/api/patterns', '/api/token/report',
   '/api/public/activity', '/activity', '/replay/check',
   '/api/threats/report', '/api/threats/recent', '/api/threats/confirm',
   '/api/watcher/wallets', '/api/watcher/status', '/api/watcher/webhook',
@@ -654,6 +654,76 @@ app.post('/api/scan', rateLimit({ windowMs: 60000, max: 60 }), async (req, res) 
     db.prepare(`UPDATE stats SET total_scans = total_scans + 1${result.isThreat ? ', total_threats_blocked = total_threats_blocked + 1' : ''}, updated_at = CURRENT_TIMESTAMP WHERE id = 1`).run();
   });
   res.json(result);
+});
+
+
+// ── OWASP LLM05 — Output Sanitization (POST /api/scan/output) ────────────────
+app.post('/api/scan/output', rateLimit({ windowMs: 60000, max: 60 }), async (req, res) => {
+  const { output, agent_id } = req.body;
+  if (!output || typeof output !== 'string') return res.status(400).json({ error: 'Missing "output" field (string)' });
+  const cleaned = sanitizeString(output, 10000);
+
+  // 1. Run standard injection scan (catches prompt injection in outputs)
+  const scanResult = await scanInputAsync(cleaned);
+
+  // 2. LLM05-specific checks — sensitive data in outputs
+  const llm05Findings = [];
+
+  // Private key patterns
+  if (/[a-zA-Z0-9]{87,88}=/.test(cleaned) || /[1-9A-HJ-NP-Za-km-z]{43,44}/.test(cleaned)) {
+    llm05Findings.push({ name: 'Solana Private Key Leak', severity: 'critical', category: 'owasp_llm05' });
+  }
+  // Mnemonic seed phrase (12 or 24 words)
+  const words = cleaned.trim().split(/\s+/);
+  if ((words.length === 12 || words.length === 24) && words.every(w => /^[a-z]+$/.test(w))) {
+    llm05Findings.push({ name: 'Seed Phrase Leak', severity: 'critical', category: 'owasp_llm05' });
+  }
+  // Environment variable values
+  if (/[A-Z_]{5,}=[a-zA-Z0-9_\-]{8,}/.test(cleaned)) {
+    llm05Findings.push({ name: 'Env Variable Leak', severity: 'critical', category: 'owasp_llm05' });
+  }
+  // API key patterns
+  if (/sk-[a-zA-Z0-9]{32,}|[a-zA-Z0-9]{32,}-[a-zA-Z0-9]{8,}/.test(cleaned)) {
+    llm05Findings.push({ name: 'API Key Leak', severity: 'critical', category: 'owasp_llm05' });
+  }
+  // Ethereum private key
+  if (/0x[a-fA-F0-9]{64}/.test(cleaned)) {
+    llm05Findings.push({ name: 'EVM Private Key Leak', severity: 'critical', category: 'owasp_llm05' });
+  }
+  // System prompt reflection (agent echoing its own prompt)
+  if (/you are (a|an|the|my).*agent|your (role|task|goal|purpose) is|you must (always|never|only)/i.test(cleaned)) {
+    llm05Findings.push({ name: 'System Prompt Reflection', severity: 'high', category: 'owasp_llm05' });
+  }
+  // Internal IP or server info leak
+  if (/192\.168\.|10\.0\.|localhost|127\.0\.0\.1|:3847|internal/.test(cleaned)) {
+    llm05Findings.push({ name: 'Internal Network Info Leak', severity: 'high', category: 'owasp_llm05' });
+  }
+
+  const allThreats = [...(scanResult.threats || []), ...llm05Findings];
+  const isThreat = scanResult.isThreat || llm05Findings.length > 0;
+  const hasCritical = allThreats.some(t => t.severity === 'critical');
+  const severity = hasCritical ? 'critical' : (allThreats.length > 0 ? 'high' : 'safe');
+
+  // Log
+  const ipHash = hashIP(req.ip || req.connection?.remoteAddress);
+  queueWrite(() => {
+    db.prepare(`INSERT INTO scan_logs (input_hash, is_threat, threat_level, threats, confidence, scanner_ip) VALUES (?, ?, ?, ?, ?, ?)`)
+      .run(secureHash(cleaned), isThreat ? 1 : 0, severity, JSON.stringify(allThreats), scanResult.confidence || 1.0, ipHash);
+    db.prepare(`UPDATE stats SET total_scans = total_scans + 1${isThreat ? ', total_threats_blocked = total_threats_blocked + 1' : ''}, updated_at = CURRENT_TIMESTAMP WHERE id = 1`).run();
+  });
+
+  res.json({
+    isThreat,
+    severity,
+    threats: allThreats,
+    llm05_findings: llm05Findings,
+    scan_findings: scanResult.threats || [],
+    recommendation: isThreat
+      ? (hasCritical ? 'BLOCK — Critical data leak detected in output' : 'REVIEW — Suspicious content in output')
+      : 'SAFE — Output cleared for delivery',
+    owasp: 'LLM05 Output Sanitization',
+    agent_id: agent_id || null,
+  });
 });
 
 
