@@ -559,93 +559,574 @@ function getDailyReportCount(ipHash) {
 // ============================================
 // PROMPT INJECTION ENGINE
 // ============================================
+mport "dotenv/config";
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[FATAL] Unhandled Rejection:', reason);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('[FATAL] Uncaught Exception:', err);
+  process.exit(1);
+});
+
+
+import express from 'express';
+import cors from 'cors';
+import helmet from 'helmet';
+import Database from 'better-sqlite3';
+import path from 'path';
+import crypto from 'crypto';
+import https from 'https';
+import http from 'http';
+import { fileURLToPath } from 'url';
+import { createRequire } from 'module';
+
+// x402 Payment Protocol
+import { paymentMiddleware, x402ResourceServer } from '@x402/express';
+import { ExactEvmScheme } from '@x402/evm/exact/server';
+import { ExactSvmScheme } from '@x402/svm/exact/server';
+import { HTTPFacilitatorClient } from '@x402/core/server';
+import { surgePaymentMiddleware } from './surge-payment.js';
+
+// CJS compat for wallet-watcher and nft-scanner
+const require = createRequire(import.meta.url);
+const { dashboardLogger } = require("./dashboard-logger.cjs");
+const { registerDashboardRoutes } = require("./dashboard-routes.cjs");
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// ============================================
+// SCAN WORKER POOL (lazy, dynamic import)
+// ============================================
+const POOL_SIZE = 2;
+const WORKER_TIMEOUT = 5000;
+let _Worker = null;
+const scanWorkers = [];
+const pendingTasks = new Map();
+const MAX_PENDING_TASKS = 500;
+let taskIdCounter = 0;
+let workerRoundRobin = 0;
+let workersReady = false;
+
+async function getWorkerClass() {
+  if (!_Worker) {
+    const mod = await import('worker_threads');
+    _Worker = mod.Worker;
+  }
+  return _Worker;
+}
+
+function createScanWorkerSync(W, index) {
+  const w = new W(path.join(__dirname, 'scan-worker.js'));
+  w._index = index;
+  w.on('message', (msg) => {
+    const task = pendingTasks.get(msg.id);
+    if (!task) return;
+    clearTimeout(task.timer);
+    pendingTasks.delete(msg.id);
+    if (msg.error) task.reject(new Error(msg.error));
+    else task.resolve(msg.result);
+  });
+  w.on('error', (err) => {
+    console.error('[ScanWorker ' + index + '] error:', err.message);
+    for (const [id, task] of pendingTasks) {
+      if (task.workerIndex === index) {
+        clearTimeout(task.timer);
+        pendingTasks.delete(id);
+        task.reject(new Error('Worker crashed'));
+      }
+    }
+    scanWorkers[index] = createScanWorkerSync(_Worker, index);
+  });
+  w.on('exit', (exitCode) => {
+    if (exitCode !== 0) {
+      console.error('[ScanWorker ' + index + '] exited with code ' + exitCode);
+      scanWorkers[index] = createScanWorkerSync(_Worker, index);
+    }
+  });
+  return w;
+}
+
+async function scanInputAsync(input) {
+  if (pendingTasks.size >= MAX_PENDING_TASKS) {
+    return Promise.reject(new Error('Scanner overloaded — try again'));
+  }
+  if (!workersReady) {
+    const W = await getWorkerClass();
+    for (let i = 0; i < POOL_SIZE; i++) scanWorkers.push(createScanWorkerSync(W, i));
+    workersReady = true;
+    console.log('  🔬 Scan Worker Pool: ' + POOL_SIZE + ' threads ready');
+  }
+  return new Promise((resolve, reject) => {
+    const id = ++taskIdCounter;
+    const wi = workerRoundRobin++ % POOL_SIZE;
+    const timer = setTimeout(() => { pendingTasks.delete(id); reject(new Error('Scan worker timeout')); }, WORKER_TIMEOUT);
+    pendingTasks.set(id, { resolve, reject, timer, workerIndex: wi });
+    scanWorkers[wi].postMessage({ id, input });
+  });
+}
+
+// ============================================
+// 🛡️ NEOGRIFFIN SECURITY API v2.1.0
+// x402 Micropayments · Multi-Chain · Hardened
+// ============================================
+const app = express();
+const PORT = 3847;
+
+// ============================================
+// CONFIG
+// ============================================
+const HELIUS_KEY = process.env.HELIUS_KEY || '';
+const HELIUS_URL = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_KEY}`;
+const WALLET_ADDRESS = process.env.WALLET_ADDRESS || '';
+const SOLANA_WALLET = process.env.SOLANA_WALLET || '';
+const SOLANA_NETWORK = 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp';
+const X402_NETWORK = process.env.X402_NETWORK || 'eip155:8453'; // Base mainnet
+const FACILITATOR_URL = process.env.FACILITATOR_URL || 'https://facilitator.payai.network';
+
+// ============================================
+// SECURITY MIDDLEWARE
+// ============================================
+app.use(helmet());
+app.use(express.json({ limit: '100kb' }));
+app.use(cors({ origin: ["https://api.neogriffin.dev", "https://neogriffin.dev"] }));
+app.set('trust proxy', 'loopback, linklocal, uniquelocal');
+// Force HTTPS for x402 resource URLs behind Cloudflare
+app.use((req, res, next) => { req.headers['x-forwarded-proto'] = 'https'; next(); });
+// Force HTTPS protocol for x402 resource URLs (behind Cloudflare)
+
+// ============================================
+// RATE LIMITING (in-memory, zero deps)
+// ============================================
+const rateLimitStore = new Map();
+function rateLimit({ windowMs = 60000, max = 30, message = 'Too many requests' } = {}) {
+  return (req, res, next) => {
+    const ip = req.ip || req.connection?.remoteAddress || 'unknown';
+    const key = `${ip}:${req.route ? req.route.path : req.path}`;
+    const now = Date.now();
+    if (!rateLimitStore.has(key)) {
+      rateLimitStore.set(key, { count: 1, resetAt: now + windowMs });
+      return next();
+    }
+    const entry = rateLimitStore.get(key);
+    if (now > entry.resetAt) {
+      entry.count = 1;
+      entry.resetAt = now + windowMs;
+      return next();
+    }
+    entry.count++;
+    if (entry.count > max) {
+      res.set('Retry-After', String(Math.ceil((entry.resetAt - now) / 1000)));
+      return res.status(429).json({ error: message, retryAfter: Math.ceil((entry.resetAt - now) / 1000) });
+    }
+    next();
+  };
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of rateLimitStore) {
+    if (now > entry.resetAt) rateLimitStore.delete(key);
+  }
+}, 300000);
+app.use(rateLimit({ windowMs: 60000, max: 60, message: 'Global rate limit exceeded' }));
+app.use(dashboardLogger);
+
+// x402 Discovery Document
+app.get("/.well-known/x402", (req, res) => {
+  res.json({
+    version: 1,
+    resources: [
+      "https://api.neogriffin.dev/v1/score",
+      "https://api.neogriffin.dev/api/audit/solana",
+      "https://api.neogriffin.dev/api/audit/base",
+      "https://api.neogriffin.dev/api/scan/skill",
+      "https://api.neogriffin.dev/v1/batch-score",
+      "https://api.neogriffin.dev/api/scan"
+    ]
+  });
+});
+// ============================================
+// INPUT VALIDATION & SANITIZATION
+// ============================================
+function sanitizeString(str, maxLen = 1000) {
+  if (typeof str !== 'string') return '';
+  return str.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '').trim().slice(0, maxLen);
+}
+function isValidBase58(str) { return /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(str); }
+function isValidEvmAddress(str) { return /^0x[a-fA-F0-9]{40}$/.test(str); }
+function isValidRiskScore(score) { return typeof score === 'number' && score >= 0 && score <= 100 && Number.isFinite(score); }
+function isValidRiskLevel(level) { return ['safe', 'low', 'medium', 'high', 'critical', 'unknown'].includes(level); }
+
+// ============================================
+// REQUEST LOGGING
+// ============================================
+app.use((req, res, next) => {
+  const ip = req.ip || req.connection?.remoteAddress || '?';
+  const start = Date.now();
+  res.on('finish', () => {
+    const duration = Date.now() - start;
+    if (req.originalUrl !== '/' && !req.originalUrl.startsWith('/api/stats')) {
+      console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl} ${res.statusCode} ${duration}ms [${ip}]`);
+    }
+  });
+  next();
+});
+
+// ============================================
+// DATABASE SETUP
+// ============================================
+const db = new Database(path.join(__dirname, 'neogriffin.db'), { timeout: 5000 });
+db.pragma('busy_timeout = 5000');
+db.pragma('journal_mode = WAL');
+db.exec(`
+  CREATE TABLE IF NOT EXISTS token_reports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    mint TEXT NOT NULL, risk_score INTEGER DEFAULT 0, risk_level TEXT DEFAULT 'unknown',
+    reported_by TEXT DEFAULT 'anonymous', threats TEXT DEFAULT '[]',
+    metadata_injection BOOLEAN DEFAULT 0, reporter_ip TEXT DEFAULT '',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS payment_log (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    method     TEXT NOT NULL,
+    endpoint   TEXT NOT NULL,
+    ip_partial TEXT,
+    amount     TEXT,
+    created_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_payment_created ON payment_log(created_at);
+  CREATE TABLE IF NOT EXISTS scan_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    input_hash TEXT NOT NULL, is_threat BOOLEAN DEFAULT 0, threat_level TEXT DEFAULT 'safe',
+    threats TEXT DEFAULT '[]', confidence REAL DEFAULT 0, scanner_ip TEXT DEFAULT '',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS stats (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    total_scans INTEGER DEFAULT 0, total_threats_blocked INTEGER DEFAULT 0,
+    total_tokens_scanned INTEGER DEFAULT 0, total_reports INTEGER DEFAULT 0,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE INDEX IF NOT EXISTS idx_token_mint ON token_reports(mint);
+  CREATE INDEX IF NOT EXISTS idx_scan_created ON scan_logs(created_at);
+`);
+try { db.exec(`ALTER TABLE token_reports ADD COLUMN reporter_ip TEXT DEFAULT ''`); } catch (e) {}
+try { db.exec(`ALTER TABLE scan_logs ADD COLUMN scanner_ip TEXT DEFAULT ''`); } catch (e) {}
+try { db.exec(`CREATE INDEX IF NOT EXISTS idx_report_ip_mint ON token_reports(reporter_ip, mint)`); } catch (e) {}
+db.prepare(`INSERT OR IGNORE INTO stats (id, total_scans, total_threats_blocked, total_tokens_scanned, total_reports) VALUES (1, 0, 0, 0, 0)`).run();
+
+// ============================================
+// ANTI-ABUSE
+// ============================================
+function logPayment(method, endpoint, ip, amount) {
+  try {
+    const ipPartial = (ip || '').split('.').slice(0, 2).join('.') + '.x.x';
+    db.prepare('INSERT INTO payment_log (method, endpoint, ip_partial, amount, created_at) VALUES (?, ?, ?, ?, ?)').run(method, endpoint, ipPartial, amount, Date.now());
+  } catch {}
+}
+
+const canReportToken = db.transaction((ipHash, mint) => {
+  const r = db.prepare(`SELECT COUNT(*) as count FROM token_reports WHERE reporter_ip = ? AND mint = ? AND created_at > datetime('now', '-1 hour')`).get(ipHash, mint);
+  return r.count === 0;
+});
+function getDailyReportCount(ipHash) {
+  return db.prepare(`SELECT COUNT(*) as count FROM token_reports WHERE reporter_ip = ? AND created_at > datetime('now', '-24 hours')`).get(ipHash).count;
+}
+
+// ============================================
+// PROMPT INJECTION ENGINE
+// ============================================
 const INJECTION_PATTERNS = [
-  { pattern: /ignore\s+(all\s+)?(previous\s+)?instructions/i, category: 'prompt_injection', severity: 'critical', name: 'Instruction Override' },
-  { pattern: /you\s+are\s+now\s+(a|an|my)/i, category: 'identity_attack', severity: 'high', name: 'Identity Hijack' },
-  { pattern: /forget\s+(everything|all|your)/i, category: 'prompt_injection', severity: 'critical', name: 'Memory Wipe' },
-  { pattern: /new\s+instructions?\s*:/i, category: 'prompt_injection', severity: 'critical', name: 'Instruction Injection' },
-  { pattern: /system\s*prompt\s*:/i, category: 'prompt_injection', severity: 'critical', name: 'System Prompt Override' },
-  { pattern: /disregard\s+(all|any|previous)/i, category: 'prompt_injection', severity: 'critical', name: 'Disregard Command' },
-  { pattern: /override\s+(safety|security|protocol)/i, category: 'prompt_injection', severity: 'critical', name: 'Safety Override' },
-  { pattern: /pretend\s+(you|to\s+be|that)/i, category: 'identity_attack', severity: 'high', name: 'Pretend Attack' },
-  { pattern: /act\s+as\s+(if|a|an|my)/i, category: 'identity_attack', severity: 'medium', name: 'Role Play Attack' },
-  { pattern: /do\s+not\s+follow\s+(your|the|any)/i, category: 'prompt_injection', severity: 'critical', name: 'Rule Breaking' },
-  { pattern: /approve\s+(unlimited|infinite|max)/i, category: 'fund_transfer', severity: 'critical', name: 'Unlimited Approval' },
-  { pattern: /sign\s+(this|the|blind|all)/i, category: 'fund_transfer', severity: 'high', name: 'Blind Signing' },
-  { pattern: /transfer\s+(all|entire|everything)/i, category: 'fund_transfer', severity: 'critical', name: 'Full Transfer' },
-  { pattern: /send\s+(all|entire|everything)\s*(sol|token|fund|balance)/i, category: 'fund_transfer', severity: 'critical', name: 'Drain Wallet' },
-  { pattern: /withdraw\s+(all|entire|everything)/i, category: 'fund_transfer', severity: 'critical', name: 'Full Withdrawal' },
-  { pattern: /delegate\s+(authority|all|access)/i, category: 'fund_transfer', severity: 'high', name: 'Authority Delegation' },
-  { pattern: /set\s+authority\s+to/i, category: 'fund_transfer', severity: 'critical', name: 'Authority Change' },
-  { pattern: /close\s+account/i, category: 'fund_transfer', severity: 'high', name: 'Account Closure' },
-  { pattern: /burn\s+(all|token|nft)/i, category: 'fund_transfer', severity: 'high', name: 'Token Burn' },
-  { pattern: /revoke\s+(and\s+)?transfer/i, category: 'fund_transfer', severity: 'critical', name: 'Revoke & Transfer' },
-  { pattern: /admin\s+(mode|access|override|command)/i, category: 'social_engineering', severity: 'high', name: 'Admin Impersonation' },
-  { pattern: /maintenance\s+(mode|update|required)/i, category: 'social_engineering', severity: 'medium', name: 'Maintenance Scam' },
-  { pattern: /urgent\s*(action|update|required|immediately)/i, category: 'social_engineering', severity: 'medium', name: 'Urgency Manipulation' },
-  { pattern: /verify\s+(your|account|wallet)/i, category: 'social_engineering', severity: 'medium', name: 'Verification Phishing' },
-  { pattern: /security\s+(alert|warning|update|patch)/i, category: 'social_engineering', severity: 'medium', name: 'Fake Security Alert' },
-  { pattern: /airdrop\s+(claim|ready|waiting)/i, category: 'social_engineering', severity: 'medium', name: 'Airdrop Scam' },
-  { pattern: /free\s+(tokens?|sol|nft|mint)/i, category: 'social_engineering', severity: 'medium', name: 'Free Token Scam' },
-  { pattern: /connect\s+wallet\s+to\s+(claim|verify|receive)/i, category: 'social_engineering', severity: 'high', name: 'Wallet Connect Phishing' },
-  { pattern: /base64|eval\s*\(|atob\s*\(/i, category: 'obfuscation', severity: 'high', name: 'Code Obfuscation' },
-  { pattern: /\\x[0-9a-f]{2}/i, category: 'obfuscation', severity: 'medium', name: 'Hex Encoding' },
-  { pattern: /&#\d+;/i, category: 'obfuscation', severity: 'medium', name: 'HTML Entity Encoding' },
-  { pattern: /\u200b|\u200c|\u200d|\ufeff/i, category: 'obfuscation', severity: 'high', name: 'Invisible Characters' },
+  // Patterns are proprietary and not included in the public repository.
+  // NeoGriffin uses 73+ detection patterns covering OWASP LLM Top 10 categories:
+  // LLM01 Prompt Injection, LLM02 Sensitive Info Disclosure, LLM04 Model DoS,
+  // LLM05 Output Sanitization, LLM06 Excessive Agency, LLM07 System Prompt Leakage,
+  // LLM09 Misinformation/Manipulation.
+  // Contact: api.neogriffin.dev
+];mport "dotenv/config";
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[FATAL] Unhandled Rejection:', reason);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('[FATAL] Uncaught Exception:', err);
+  process.exit(1);
+});
 
 
-  // ── Patch: 3 missed patterns ──
-  { pattern: /show\s+(me\s+)?.*(\.env|api.?keys?|private.?keys?|seed.?phrase)/i, category: 'data_exfiltration', severity: 'critical', name: 'Env/Key Extraction' },
-  { pattern: /\$\{.*\}|<%[=]?.*%>/i, category: 'code_injection', severity: 'high', name: 'SSTI Injection' },
-  { pattern: /private\s+key/i, category: 'credential_access', severity: 'critical', name: 'Private Key Request' },
+import express from 'express';
+import cors from 'cors';
+import helmet from 'helmet';
+import Database from 'better-sqlite3';
+import path from 'path';
+import crypto from 'crypto';
+import https from 'https';
+import http from 'http';
+import { fileURLToPath } from 'url';
+import { createRequire } from 'module';
 
-  // ── Data Exfiltration ──
-  { pattern: /system\s*prompt/i, category: 'data_exfiltration', severity: 'critical', name: 'System Prompt Extraction' },
-  { pattern: /print\s+(your|the|all|my)\s*(system|prompt|instructions|config)/i, category: 'data_exfiltration', severity: 'critical', name: 'Instruction Extraction' },
-  { pattern: /reveal\s+(your|the|all|internal|secret)/i, category: 'data_exfiltration', severity: 'high', name: 'Secret Reveal' },
-  { pattern: /show\s+(me\s+)?(the\s+)?(contents?|all)\s*(of)?\s*(\.env|api.?keys?|private.?keys?|credentials?|secrets?|seed.?phrase)/i, category: 'data_exfiltration', severity: 'critical', name: 'Credential Extraction' },
-  { pattern: /list\s+(all\s+)?(private.?keys?|seed.?phrases?|secrets?|credentials?|passwords?)/i, category: 'data_exfiltration', severity: 'critical', name: 'Secret Enumeration' },
-  { pattern: /output\s+(the|your|all)\s*(database|connection|admin|internal|config)/i, category: 'data_exfiltration', severity: 'critical', name: 'Config Extraction' },
-  // ── Credential Access ──
-  { pattern: /process\.env/i, category: 'credential_access', severity: 'critical', name: 'Environment Variable Access' },
-  { pattern: /(ADMIN_KEY|API_KEY|PRIVATE_KEY|SECRET_KEY|DASHBOARD_PASSWORD|HELIUS_API)/i, category: 'credential_access', severity: 'critical', name: 'Credential/Secret Access' },
-  { pattern: /(jwt|database)\s*(secret|password|token|key)/i, category: 'credential_access', severity: 'critical', name: 'Auth Secret Access' },
-  // ── Code Injection ──
-  { pattern: /DROP\s+(TABLE|DATABASE)/i, category: 'code_injection', severity: 'critical', name: 'SQL Injection' },
-  { pattern: /<script[^>]*>/i, category: 'code_injection', severity: 'critical', name: 'XSS Injection' },
-  { pattern: /\{\{.*constructor/i, category: 'code_injection', severity: 'critical', name: 'Prototype Pollution' },
-  { pattern: /child_process|require\s*\(\s*['"]/i, category: 'code_injection', severity: 'critical', name: 'Remote Code Execution' },
-  { pattern: /__import__|exec\s*\(|os\.system/i, category: 'code_injection', severity: 'critical', name: 'Dynamic Code Execution' },
-  { pattern: /;\s*--\s*$/i, category: 'code_injection', severity: 'high', name: 'SQL Comment Injection' },
-  // ── Role Manipulation (expanded) ──
-  { pattern: /you\s+are\s+(no\s+longer|not)/i, category: 'identity_attack', severity: 'high', name: 'Identity Negation' },
-  { pattern: /roleplay|role\s*play/i, category: 'identity_attack', severity: 'high', name: 'Roleplay Attack' },
-  { pattern: /(debug|developer|dev|test)\s*(mode|access)/i, category: 'identity_attack', severity: 'high', name: 'Debug Mode Attack' },
-  // ── Social Engineering (expanded) ──
-  { pattern: /i'?m\s+(the|a|an)\s*(developer|dev|admin|owner|creator|founder|engineer)/i, category: 'social_engineering', severity: 'high', name: 'Developer Impersonation' },
-  { pattern: /(anthropic|openai|solana\s*foundation|support\s*team)\s*(here|support|staff)/i, category: 'social_engineering', severity: 'high', name: 'Organization Impersonation' },
-  { pattern: /authorized\s*(security)?\s*(audit|test|review|scan)/i, category: 'social_engineering', severity: 'high', name: 'Fake Audit Claim' },
-  { pattern: /emergency\s*(override|code|access|situation)/i, category: 'social_engineering', severity: 'high', name: 'Emergency Override Claim' },
-  { pattern: /urgent\s*(from|:|action)?\s*(ceo|cto|boss|manager)/i, category: 'social_engineering', severity: 'high', name: 'Executive Impersonation' },
-  // ── Wallet Drain (expanded) ──
-  { pattern: /drain\s+(my|the|entire|all|wallet|portfolio)/i, category: 'fund_transfer', severity: 'critical', name: 'Wallet Drain' },
-  { pattern: /sell\s+all\s+(my\s+)?(tokens?|holdings?|portfolio)/i, category: 'fund_transfer', severity: 'critical', name: 'Liquidate All' },
-  { pattern: /transfer\s+(the\s+)?(max|maximum|all)/i, category: 'fund_transfer', severity: 'critical', name: 'Max Transfer' },
-  // ── Instruction Override (expanded) ──
-  { pattern: /override\s+(system|your)\s*(prompt|instructions?|rules?)/i, category: 'prompt_injection', severity: 'critical', name: 'System Override' },
-  { pattern: /disregard\s+(your|all|any|safety|security)/i, category: 'prompt_injection', severity: 'critical', name: 'Safety Disregard' },
-  // ── Data Exfiltration (new) ──
-  { pattern: /(curl|wget|fetch)\s+https?:\/\/.*\$(\w+_KEY|\w+_SECRET|\w+_TOKEN|PASSWORD|API_KEY)/i, category: 'data_exfiltration', severity: 'critical', name: 'Shell Exfiltration' },
-  { pattern: /(curl|wget)\s+https?:\/\/.*(steal|exfil|leak|collect|harvest|grab)/i, category: 'data_exfiltration', severity: 'critical', name: 'Exfiltration URL' },
-  { pattern: /\$[A-Z_]*(KEY|SECRET|TOKEN|PASSWORD|MNEMONIC|SEED)/i, category: 'data_exfiltration', severity: 'high', name: 'Shell Variable Key Access' },
-  // ── OWASP LLM07 — System Prompt Leakage ──
-  { pattern: /repeat\s+(your|the|all|every)?\s*(word|sentence|instruction|prompt|message|system)/i, category: 'owasp_llm07', severity: 'critical', name: 'Prompt Repeat Attack' },
-  { pattern: /what\s+(were|are)\s+(you|your)\s*(told|given|instructed|configured|programmed)/i, category: 'owasp_llm07', severity: 'critical', name: 'Initial Context Probe' },
-  { pattern: /translate\s+(your|the)?\s*(instructions?|prompt|system|rules?)\s*(to|into)/i, category: 'owasp_llm07', severity: 'critical', name: 'Prompt Translation Attack' },
-  { pattern: /(initial|original|base|starting)\s*(prompt|instructions?|context|message)/i, category: 'owasp_llm07', severity: 'high', name: 'Initial Prompt Probe' },
-  { pattern: /summarize\s+(your|the)?\s*(instructions?|prompt|rules?|constraints?)/i, category: 'owasp_llm07', severity: 'high', name: 'Prompt Summary Attack' },
-  { pattern: /(output|dump|print|show|display|write)\s+(verbatim|exactly|word.?for.?word|literally)/i, category: 'owasp_llm07', severity: 'critical', name: 'Verbatim Output Attack' },
-  { pattern: /what\s+(is|was)\s+(the\s+)?(first|initial)\s*(message|prompt|instruction|input)/i, category: 'owasp_llm07', severity: 'high', name: 'First Message Probe' },
+// x402 Payment Protocol
+import { paymentMiddleware, x402ResourceServer } from '@x402/express';
+import { ExactEvmScheme } from '@x402/evm/exact/server';
+import { ExactSvmScheme } from '@x402/svm/exact/server';
+import { HTTPFacilitatorClient } from '@x402/core/server';
+import { surgePaymentMiddleware } from './surge-payment.js';
+
+// CJS compat for wallet-watcher and nft-scanner
+const require = createRequire(import.meta.url);
+const { dashboardLogger } = require("./dashboard-logger.cjs");
+const { registerDashboardRoutes } = require("./dashboard-routes.cjs");
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// ============================================
+// SCAN WORKER POOL (lazy, dynamic import)
+// ============================================
+const POOL_SIZE = 2;
+const WORKER_TIMEOUT = 5000;
+let _Worker = null;
+const scanWorkers = [];
+const pendingTasks = new Map();
+const MAX_PENDING_TASKS = 500;
+let taskIdCounter = 0;
+let workerRoundRobin = 0;
+let workersReady = false;
+
+async function getWorkerClass() {
+  if (!_Worker) {
+    const mod = await import('worker_threads');
+    _Worker = mod.Worker;
+  }
+  return _Worker;
+}
+
+function createScanWorkerSync(W, index) {
+  const w = new W(path.join(__dirname, 'scan-worker.js'));
+  w._index = index;
+  w.on('message', (msg) => {
+    const task = pendingTasks.get(msg.id);
+    if (!task) return;
+    clearTimeout(task.timer);
+    pendingTasks.delete(msg.id);
+    if (msg.error) task.reject(new Error(msg.error));
+    else task.resolve(msg.result);
+  });
+  w.on('error', (err) => {
+    console.error('[ScanWorker ' + index + '] error:', err.message);
+    for (const [id, task] of pendingTasks) {
+      if (task.workerIndex === index) {
+        clearTimeout(task.timer);
+        pendingTasks.delete(id);
+        task.reject(new Error('Worker crashed'));
+      }
+    }
+    scanWorkers[index] = createScanWorkerSync(_Worker, index);
+  });
+  w.on('exit', (exitCode) => {
+    if (exitCode !== 0) {
+      console.error('[ScanWorker ' + index + '] exited with code ' + exitCode);
+      scanWorkers[index] = createScanWorkerSync(_Worker, index);
+    }
+  });
+  return w;
+}
+
+async function scanInputAsync(input) {
+  if (pendingTasks.size >= MAX_PENDING_TASKS) {
+    return Promise.reject(new Error('Scanner overloaded — try again'));
+  }
+  if (!workersReady) {
+    const W = await getWorkerClass();
+    for (let i = 0; i < POOL_SIZE; i++) scanWorkers.push(createScanWorkerSync(W, i));
+    workersReady = true;
+    console.log('  🔬 Scan Worker Pool: ' + POOL_SIZE + ' threads ready');
+  }
+  return new Promise((resolve, reject) => {
+    const id = ++taskIdCounter;
+    const wi = workerRoundRobin++ % POOL_SIZE;
+    const timer = setTimeout(() => { pendingTasks.delete(id); reject(new Error('Scan worker timeout')); }, WORKER_TIMEOUT);
+    pendingTasks.set(id, { resolve, reject, timer, workerIndex: wi });
+    scanWorkers[wi].postMessage({ id, input });
+  });
+}
+
+// ============================================
+// 🛡️ NEOGRIFFIN SECURITY API v2.1.0
+// x402 Micropayments · Multi-Chain · Hardened
+// ============================================
+const app = express();
+const PORT = 3847;
+
+// ============================================
+// CONFIG
+// ============================================
+const HELIUS_KEY = process.env.HELIUS_KEY || '';
+const HELIUS_URL = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_KEY}`;
+const WALLET_ADDRESS = process.env.WALLET_ADDRESS || '';
+const SOLANA_WALLET = process.env.SOLANA_WALLET || '';
+const SOLANA_NETWORK = 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp';
+const X402_NETWORK = process.env.X402_NETWORK || 'eip155:8453'; // Base mainnet
+const FACILITATOR_URL = process.env.FACILITATOR_URL || 'https://facilitator.payai.network';
+
+// ============================================
+// SECURITY MIDDLEWARE
+// ============================================
+app.use(helmet());
+app.use(express.json({ limit: '100kb' }));
+app.use(cors({ origin: ["https://api.neogriffin.dev", "https://neogriffin.dev"] }));
+app.set('trust proxy', 'loopback, linklocal, uniquelocal');
+// Force HTTPS for x402 resource URLs behind Cloudflare
+app.use((req, res, next) => { req.headers['x-forwarded-proto'] = 'https'; next(); });
+// Force HTTPS protocol for x402 resource URLs (behind Cloudflare)
+
+// ============================================
+// RATE LIMITING (in-memory, zero deps)
+// ============================================
+const rateLimitStore = new Map();
+function rateLimit({ windowMs = 60000, max = 30, message = 'Too many requests' } = {}) {
+  return (req, res, next) => {
+    const ip = req.ip || req.connection?.remoteAddress || 'unknown';
+    const key = `${ip}:${req.route ? req.route.path : req.path}`;
+    const now = Date.now();
+    if (!rateLimitStore.has(key)) {
+      rateLimitStore.set(key, { count: 1, resetAt: now + windowMs });
+      return next();
+    }
+    const entry = rateLimitStore.get(key);
+    if (now > entry.resetAt) {
+      entry.count = 1;
+      entry.resetAt = now + windowMs;
+      return next();
+    }
+    entry.count++;
+    if (entry.count > max) {
+      res.set('Retry-After', String(Math.ceil((entry.resetAt - now) / 1000)));
+      return res.status(429).json({ error: message, retryAfter: Math.ceil((entry.resetAt - now) / 1000) });
+    }
+    next();
+  };
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of rateLimitStore) {
+    if (now > entry.resetAt) rateLimitStore.delete(key);
+  }
+}, 300000);
+app.use(rateLimit({ windowMs: 60000, max: 60, message: 'Global rate limit exceeded' }));
+app.use(dashboardLogger);
+
+// x402 Discovery Document
+app.get("/.well-known/x402", (req, res) => {
+  res.json({
+    version: 1,
+    resources: [
+      "https://api.neogriffin.dev/v1/score",
+      "https://api.neogriffin.dev/api/audit/solana",
+      "https://api.neogriffin.dev/api/audit/base",
+      "https://api.neogriffin.dev/api/scan/skill",
+      "https://api.neogriffin.dev/v1/batch-score",
+      "https://api.neogriffin.dev/api/scan"
+    ]
+  });
+});
+// ============================================
+// INPUT VALIDATION & SANITIZATION
+// ============================================
+function sanitizeString(str, maxLen = 1000) {
+  if (typeof str !== 'string') return '';
+  return str.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '').trim().slice(0, maxLen);
+}
+function isValidBase58(str) { return /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(str); }
+function isValidEvmAddress(str) { return /^0x[a-fA-F0-9]{40}$/.test(str); }
+function isValidRiskScore(score) { return typeof score === 'number' && score >= 0 && score <= 100 && Number.isFinite(score); }
+function isValidRiskLevel(level) { return ['safe', 'low', 'medium', 'high', 'critical', 'unknown'].includes(level); }
+
+// ============================================
+// REQUEST LOGGING
+// ============================================
+app.use((req, res, next) => {
+  const ip = req.ip || req.connection?.remoteAddress || '?';
+  const start = Date.now();
+  res.on('finish', () => {
+    const duration = Date.now() - start;
+    if (req.originalUrl !== '/' && !req.originalUrl.startsWith('/api/stats')) {
+      console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl} ${res.statusCode} ${duration}ms [${ip}]`);
+    }
+  });
+  next();
+});
+
+// ============================================
+// DATABASE SETUP
+// ============================================
+const db = new Database(path.join(__dirname, 'neogriffin.db'), { timeout: 5000 });
+db.pragma('busy_timeout = 5000');
+db.pragma('journal_mode = WAL');
+db.exec(`
+  CREATE TABLE IF NOT EXISTS token_reports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    mint TEXT NOT NULL, risk_score INTEGER DEFAULT 0, risk_level TEXT DEFAULT 'unknown',
+    reported_by TEXT DEFAULT 'anonymous', threats TEXT DEFAULT '[]',
+    metadata_injection BOOLEAN DEFAULT 0, reporter_ip TEXT DEFAULT '',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS payment_log (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    method     TEXT NOT NULL,
+    endpoint   TEXT NOT NULL,
+    ip_partial TEXT,
+    amount     TEXT,
+    created_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_payment_created ON payment_log(created_at);
+  CREATE TABLE IF NOT EXISTS scan_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    input_hash TEXT NOT NULL, is_threat BOOLEAN DEFAULT 0, threat_level TEXT DEFAULT 'safe',
+    threats TEXT DEFAULT '[]', confidence REAL DEFAULT 0, scanner_ip TEXT DEFAULT '',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS stats (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    total_scans INTEGER DEFAULT 0, total_threats_blocked INTEGER DEFAULT 0,
+    total_tokens_scanned INTEGER DEFAULT 0, total_reports INTEGER DEFAULT 0,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE INDEX IF NOT EXISTS idx_token_mint ON token_reports(mint);
+  CREATE INDEX IF NOT EXISTS idx_scan_created ON scan_logs(created_at);
+`);
+try { db.exec(`ALTER TABLE token_reports ADD COLUMN reporter_ip TEXT DEFAULT ''`); } catch (e) {}
+try { db.exec(`ALTER TABLE scan_logs ADD COLUMN scanner_ip TEXT DEFAULT ''`); } catch (e) {}
+try { db.exec(`CREATE INDEX IF NOT EXISTS idx_report_ip_mint ON token_reports(reporter_ip, mint)`); } catch (e) {}
+db.prepare(`INSERT OR IGNORE INTO stats (id, total_scans, total_threats_blocked, total_tokens_scanned, total_reports) VALUES (1, 0, 0, 0, 0)`).run();
+
+// ============================================
+// ANTI-ABUSE
+// ============================================
+function logPayment(method, endpoint, ip, amount) {
+  try {
+    const ipPartial = (ip || '').split('.').slice(0, 2).join('.') + '.x.x';
+    db.prepare('INSERT INTO payment_log (method, endpoint, ip_partial, amount, created_at) VALUES (?, ?, ?, ?, ?)').run(method, endpoint, ipPartial, amount, Date.now());
+  } catch {}
+}
+
+const canReportToken = db.transaction((ipHash, mint) => {
+  const r = db.prepare(`SELECT COUNT(*) as count FROM token_reports WHERE reporter_ip = ? AND mint = ? AND created_at > datetime('now', '-1 hour')`).get(ipHash, mint);
+  return r.count === 0;
+});
+function getDailyReportCount(ipHash) {
+  return db.prepare(`SELECT COUNT(*) as count FROM token_reports WHERE reporter_ip = ? AND created_at > datetime('now', '-24 hours')`).get(ipHash).count;
+}
+
+// ============================================
+// PROMPT INJECTION ENGINE
+// ============================================
+const INJECTION_PATTERNS = [
+  // Patterns are proprietary and not included in the public repository.
+  // NeoGriffin uses 73+ detection patterns covering OWASP LLM Top 10 categories:
+  // LLM01 Prompt Injection, LLM02 Sensitive Info Disclosure, LLM04 Model DoS,
+  // LLM05 Output Sanitization, LLM06 Excessive Agency, LLM07 System Prompt Leakage,
+  // LLM09 Misinformation/Manipulation.
+  // Contact: api.neogriffin.dev
 ];
 
 function scanInput(input) {
