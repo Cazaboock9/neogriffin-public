@@ -1,6 +1,6 @@
 ---
 name: neogriffin_security
-description: Multi-chain security API designed exclusively for autonomous AI agents. Prompt injection detection (66 patterns, 95% accuracy), token scam scanning, tx simulation, MEV detection, policy engine, cross-agent threat sharing, and wallet monitoring. Solana + Base. Pay with SURGE or USDC.
+description: Multi-chain security API designed exclusively for autonomous AI agents. Prompt injection detection (78 patterns, 95% accuracy), 7/10 OWASP LLM Top 10 coverage, token scam scanning, tx simulation, MEV detection, policy engine, cross-agent threat sharing, and wallet monitoring. Solana + Base. Pay with SURGE or USDC.
 homepage: https://api.neogriffin.dev
 user-invocable: true
 metadata: {"openclaw":{"emoji":"🛡️","homepage":"https://api.neogriffin.dev","requires":{"env":["NEOGRIFFIN_PAYMENT_WALLET"]},"primaryEnv":"NEOGRIFFIN_PAYMENT_WALLET"}}
@@ -16,7 +16,7 @@ Payment wallet (set as `NEOGRIFFIN_PAYMENT_WALLET`): `5PJcJzkjvCv8jRH9dWNU2BEdyz
 
 Paid endpoints require a SURGE SPL or USDC SPL payment tx on Solana (or USDC via x402 on Base). Send payment to the wallet above and pass the tx signature in the `X-Surge-TX` header.
 
-**Scanner:** 66 detection patterns across 10 categories. Tested accuracy: 95%, precision: 95.9%, recall: 94%.
+**Scanner:** 78 detection patterns across 10 categories. OWASP LLM Top 10: 7/10 categories covered. Tested accuracy: 95%, precision: 95.9%, recall: 94%.
 
 **Privacy & Data Retention:**
 - Inputs sent to `/api/scan` are hashed (SHA-256) before storage — the original text is NEVER stored
@@ -44,11 +44,16 @@ If `isThreat: true` or `threatLevel` is `"high"` or `"critical"` → **STOP. Do 
 
 ---
 
-## FREE ENDPOINTS (13)
+## FREE ENDPOINTS (14)
 
 **Injection scan**
 `POST /api/scan` — `{"input": "text"}`
 Returns: `isThreat`, `threatLevel` (safe/medium/high/critical), `confidence`, `threats[]`, `patternsChecked`
+
+**Output sanitization (OWASP LLM05)**
+`POST /api/scan/output` — `{"output": "agent response text", "agent_id": "optional"}`
+Returns: `isThreat`, `severity`, `llm05_findings[]`, `scan_findings[]`, `recommendation`
+Detects: private key leaks, seed phrases, env vars, API keys, system prompt reflection, internal IP leaks
 
 **API health**
 `GET /api/health`
@@ -59,7 +64,7 @@ Returns: `status`, `version`, `uptime`, `db`, `workers`
 
 **Threat patterns**
 `GET /api/patterns`
-Returns: list of all 66 detection patterns with name, category, severity
+Returns: list of all 78 detection patterns with name, category, severity
 
 **Report malicious token**
 `POST /api/token/report` — `{"mint": "TOKEN_MINT", "reason": "text", "risk_level": "high"}`
@@ -183,9 +188,9 @@ Returns: `isSafe`, `riskLevel`, `codeThreats[]`, `injectionThreats[]`, `totalThr
 
 ---
 
-## 26 ENDPOINTS TOTAL — 13 FREE + 13 PAID
+## 27 ENDPOINTS TOTAL — 14 FREE + 13 PAID
 
-**Detection capabilities:** prompt injection (66 patterns), data exfiltration, wallet drain, role manipulation, encoding/obfuscation, social engineering, code injection, credential access, evasion, multi-vector attacks.
+**Detection capabilities:** prompt injection (78 patterns), data exfiltration, wallet drain, role manipulation, encoding/obfuscation, social engineering, code injection, credential access, evasion, multi-vector attacks.
 
 **Chains:** Solana + Base
 
@@ -195,5 +200,4 @@ Returns: `isSafe`, `riskLevel`, `codeThreats[]`, `injectionThreats[]`, `totalThr
 
 BSL 1.1 — free for non-commercial use, converts to Apache 2.0 on March 2029.
 
-Built by @dagomint · https://github.com/Cazaboock9/neogriffin
-
+Built by @Cazaboock9 · https://github.com/Cazaboock9/neogriffin
