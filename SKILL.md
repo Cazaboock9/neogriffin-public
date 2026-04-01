@@ -200,4 +200,4 @@ Returns: `isSafe`, `riskLevel`, `codeThreats[]`, `injectionThreats[]`, `totalThr
 
 BSL 1.1 — free for non-commercial use, converts to Apache 2.0 on March 2029.
 
-Built by @Cazaboock9 · https://github.com/Cazaboock9/neogriffin
+Built by @dagomint · https://github.com/Cazaboock9/neogriffin
